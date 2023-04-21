@@ -1,3 +1,13 @@
+## librispeech-lm-norm
+
+To prepare data:
+
+```
+cd data
+wget https://www.openslr.org/resources/11/librispeech-lm-norm.txt.gz
+cat ~/LibriSpeech/dev-clean/*/*/*.txt | cut -d' ' -f2- > dev-clean.txt
+```
+
 <img src="./block-recurrent-transformer.png" width="450px"></img>
 
 ## Block Recurrent Transformer - Pytorch
