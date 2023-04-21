@@ -463,19 +463,10 @@ class Attend(nn.Module):
         # determine efficient attention configs for cuda and cpu
 
         self.cpu_config = Config(True, True, True)
-        self.cuda_config = None
+        self.cuda_config = Config(True, True, True)
 
         if not torch.cuda.is_available() or not use_flash_attn:
             return
-
-        device_properties = torch.cuda.get_device_properties(torch.device('cuda'))
-
-        if device_properties.major == 8 and device_properties.minor == 0:
-            print_once('A100 GPU detected, using flash attention if input tensor is on cuda')
-            self.cuda_config = Config(True, False, False)
-        else:
-            print_once('Non-A100 GPU detected, using math or mem efficient attention if input tensor is on cuda')
-            self.cuda_config = Config(False, True, True)
 
     def get_mask(self, n, device):
         if exists(self.mask) and self.mask.shape[-1] >= n:
@@ -1172,8 +1163,8 @@ class RecurrentTrainerWrapper(nn.Module):
     ):
         total_seq_len, seq_len = x.shape[1], self.seq_len
 
-        assert divisible_by(total_seq_len - 1, seq_len), f'length of sequence ({total_seq_len}) must be equal to a multiple of {seq_len} + 1 (one extra token) during training'
-        segments = total_seq_len // seq_len
+        #assert divisible_by(total_seq_len - 1, seq_len), f'length of sequence ({total_seq_len}) must be equal to a multiple of {seq_len} + 1 (one extra token) during training'
+        segments = max(1, total_seq_len // seq_len)
 
         total_loss = 0.
 
