@@ -2,11 +2,13 @@ import gzip
 import random
 import tqdm
 import numpy as np
+from pathlib import Path
 
 import torch
 from torch.optim import Adam
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
+import wandb
 
 from accelerate import Accelerator
 from block_recurrent_transformer_pytorch import BlockRecurrentTransformer, RecurrentTrainerWrapper
@@ -14,11 +16,11 @@ from block_recurrent_transformer_pytorch import BlockRecurrentTransformer, Recur
 # constants
 
 NUM_BATCHES = int(1e5)
-BATCH_SIZE = 4
-GRADIENT_ACCUMULATE_EVERY = 4
-LEARNING_RATE = 1e-4
+BATCH_SIZE = 16
+GRADIENT_ACCUMULATE_EVERY = 1
+LEARNING_RATE = 1e-3
 VALIDATE_EVERY = 100
-PRIME_LENGTH = 128
+PRIME_LENGTH = 64
 GENERATE_EVERY = 250
 GENERATE_LENGTH = 2048
 SEQ_LEN = 2048
@@ -35,7 +37,6 @@ def decode_token(token):
 
 def decode_tokens(tokens):
     return "".join(list(map(decode_token, tokens)))
-
 
 # accelerator
 
@@ -67,12 +68,19 @@ train_wrapper = RecurrentTrainerWrapper(
 
 model.to(device)
 
-# prepare enwik8 data
+# wandb
+wandb.init(project='block-recurrent')
 
-with gzip.open("./data/enwik8.gz") as file:
-    data = np.frombuffer(file.read(int(95e6)), dtype=np.uint8).copy()
-    np_train, np_valid = np.split(data, [int(90e6)])
-    data_train, data_val = torch.from_numpy(np_train), torch.from_numpy(np_valid)
+
+train_data = Path("./data/librispeech-lm-norm.txt.gz")
+with gzip.open(train_data) as file:
+    np_train = np.frombuffer(file.read(int(train_data.stat().st_size)), dtype=np.uint8).copy()
+    data_train = torch.from_numpy(np_train)
+
+valid_data = Path("./data/dev-clean.txt")
+with open(valid_data, "rb") as file:
+    np_valid = np.frombuffer(file.read(int(valid_data.stat().st_size)), dtype=np.uint8).copy()
+    data_val = torch.from_numpy(np_valid)
 
 class TextSamplerDataset(Dataset):
     def __init__(self, data, seq_len):
@@ -95,39 +103,67 @@ val_loader = cycle(DataLoader(val_dataset, batch_size=BATCH_SIZE))
 
 # optimizer
 
-optim = Adam(model.parameters(), lr = LEARNING_RATE)
+optim = Adam(model.parameters())
 
 model, optim, train_loader, val_loader = accelerator.prepare(
     model, optim, train_loader, val_loader
 )
 
+
+def compute_lr(step, warmup=NUM_BATCHES//10, lr=LEARNING_RATE):
+    # linear warmup followed by cosine decay to 10% of original
+    lrmin = lr * 0.01
+    if step < warmup:
+        t = step / warmup
+        return lrmin + (lr-lrmin) * t
+    else:
+        t = (step - warmup) / (NUM_BATCHES - warmup)
+        return lrmin + (lr-lrmin) * 0.5 * (1 + np.cos(np.pi * t))
+
+
 # training
 
-for i in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
+for step in tqdm.tqdm(range(NUM_BATCHES), mininterval=10.0, desc="training"):
+    optim.param_groups[0]["lr"] = compute_lr(step)
     model.train()
 
+    loss = 0.
     for _ in range(GRADIENT_ACCUMULATE_EVERY):
-        loss = train_wrapper(next(train_loader))
-        accelerator.backward(loss / GRADIENT_ACCUMULATE_EVERY)
+        batch_loss = train_wrapper(next(train_loader)) / GRADIENT_ACCUMULATE_EVERY
+        accelerator.backward(batch_loss)
+        loss += batch_loss
 
-    acc_print(f"training loss: {loss.item()}")
-    accelerator.clip_grad_norm_(model.parameters(), 0.5)
+    grad_norm = accelerator.clip_grad_norm_(model.parameters(), 0.5)
+    wandb.log({
+        'train/loss': loss.item(),
+        'train/ppl': loss.exp().item(),
+        'train/lr': compute_lr(step),
+        'train/step': step,
+        'train/grad_norm': grad_norm.item()
+    })
 
     optim.step()
     optim.zero_grad()
 
-    if i % VALIDATE_EVERY == 0:
+    if step % VALIDATE_EVERY == 0:
+        acc_print(f"step {step} training loss: {loss.item()} grad_norm: {grad_norm.item()}")
+
         model.eval()
         with torch.no_grad():
             loss = train_wrapper(next(val_loader))
             acc_print(f"validation loss: {loss.item()}")
+            wandb.log({
+                'valid/loss': loss.item(),
+                'valid/ppl': loss.exp().item(),
+            })
 
-    if i % GENERATE_EVERY == 0:
+
+    if step % GENERATE_EVERY == 0:
         model.eval()
         inp = random.choice(val_dataset)[:PRIME_LENGTH]
         prime = decode_tokens(inp)
-        acc_print(f"%s \n\n %s", (prime, "*" * 100))
 
         sample = train_wrapper.generate(inp[None, ...], length = GENERATE_LENGTH)
         output_str = decode_tokens(sample[0])
-        acc_print(output_str, "\n")
+        acc_print(prime, "|", output_str, "\n")
+        accelerator.save(model.state_dict(), "model.pt")
